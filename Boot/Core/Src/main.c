@@ -22,7 +22,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -72,9 +72,16 @@ static void MX_XSPI2_Init(void);
 int main(void)
 {
 
-  /* USER CODE BEGIN 1 */
-
-  /* USER CODE END 1 */
+	  /* USER CODE BEGIN 1 */
+	  __HAL_RCC_GPIOD_CLK_ENABLE();
+	  GPIO_InitTypeDef diag_gpio = {0};
+	  diag_gpio.Pin   = GPIO_PIN_10;
+	  diag_gpio.Mode  = GPIO_MODE_OUTPUT_PP;
+	  diag_gpio.Pull  = GPIO_NOPULL;
+	  diag_gpio.Speed = GPIO_SPEED_FREQ_LOW;
+	  HAL_GPIO_Init(GPIOD, &diag_gpio);
+	  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_10, GPIO_PIN_SET);
+	  /* USER CODE END 1 */
 
   /* MPU Configuration--------------------------------------------------------*/
   MPU_Config();
@@ -132,7 +139,10 @@ int main(void)
   }
 
   /* Launch the application */
-  if (BOOT_OK != BOOT_Application())
+  printf("Boot: reached BOOT_Application()\r\n");
+  BOOTStatus_TypeDef boot_status = BOOT_Application();
+  printf("Boot: BOOT_Application returned, status=%d (should never print if it jumped)\r\n", (int)boot_status);
+  if (BOOT_OK != boot_status)
   {
     Error_Handler();
   }

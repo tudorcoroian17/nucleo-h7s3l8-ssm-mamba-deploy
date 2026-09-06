@@ -21,7 +21,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
+#include "feature_pipeline.h"
+#include "parity_test_vector.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -94,7 +96,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   /* USER CODE BEGIN 2 */
-
+  FeaturePipeline_Init();
   /* USER CODE END 2 */
 
   /* Initialize leds */
@@ -120,7 +122,24 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+	  float32_t actual_logmel[MEL_N_MELS];
+	  FeaturePipeline_ComputeLogMelFrame(parity_test_frame, actual_logmel);
 
+	  float32_t max_abs_diff = 0.0f;
+	  uint32_t worst_bin = 0;
+	  for (uint32_t i = 0; i < MEL_N_MELS; i++) {
+		  float32_t diff = fabsf(actual_logmel[i] - parity_expected_logmel[i]);
+		  if (diff > max_abs_diff) {
+			  max_abs_diff = diff;
+			  worst_bin = i;
+		  }
+	  }
+
+	  BSP_LED_Toggle(LED_GREEN);
+	  printf("Appli alive, tick %lu, max_abs_diff=%.6f at bin %lu (tolerance %.4f) -> %s\r\n",
+			 HAL_GetTick(), max_abs_diff, (unsigned long)worst_bin, PARITY_TOLERANCE,
+			 (max_abs_diff <= PARITY_TOLERANCE) ? "PASS" : "FAIL");
+	  HAL_Delay(500);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
