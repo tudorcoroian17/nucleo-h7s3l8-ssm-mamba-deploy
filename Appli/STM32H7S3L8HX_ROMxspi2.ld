@@ -177,6 +177,13 @@ SECTIONS
     _ebss = .;         /* define a global symbol at bss end */
     __bss_end__ = _ebss;
   } >RAM
+  
+  .ssm_state_dtcm :
+  {
+    . = ALIGN(4);
+    *(.ssm_state_dtcm)
+    . = ALIGN(4);
+  } >DTCM
 
   RW_NONCACHEABLE :
   {

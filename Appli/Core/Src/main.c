@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include "feature_pipeline.h"
 #include "audio_ingest.h"
+#include "ssm_backbone.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -33,10 +34,13 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define LOGMEL_RESPONSE_MAGIC 0x4C4D454Cu
+#define LOGMEL_RESPONSE_MAGIC 0x4C4D454Cu		/* "LMEL" */
+#define EMBEDDING_RESPONSE_MAGIC 0x454D4245u  	/* "EMBE" */
 #define LOGMEL_MAX_FRAMES ((AUDIO_INGEST_MAX_SAMPLES / MEL_HOP_LENGTH) + 1)
 #define UART_TX_CHUNK_SIZE 4096u
 #define UART_TX_CHUNK_DELAY_MS 150
+
+#define SSM_SEND_LOGMEL_DEBUG 1  /* 0 once backbone parity is established */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -156,6 +160,9 @@ int main(void) {
 
 		BSP_LED_On(LED_GREEN); /* solid: processing and responding */
 
+		static SSMBackbone_State ssm_state __attribute__((section(".ssm_state_dtcm")));
+		SSMBackbone_Reset(&ssm_state);
+
 		uint32_t num_full_hops = num_samples / MEL_HOP_LENGTH;
 		uint32_t leftover = num_samples - (num_full_hops * MEL_HOP_LENGTH);
 		uint32_t num_frames = num_full_hops + 1;
@@ -180,10 +187,17 @@ int main(void) {
 			}
 
 			FeaturePipeline_PushHop(hop_f32);
-			FeaturePipeline_ComputeLogMelFrame(
-					FeaturePipeline_GetCurrentFrame(), logmel_output[h]);
+			FeaturePipeline_ComputeLogMelFrame(FeaturePipeline_GetCurrentFrame(), logmel_output[h]);
+
+			float32_t normalized_frame[SSM_D_MODEL];
+			SSMBackbone_NormalizeFrame(logmel_output[h], normalized_frame);
+			SSMBackbone_ProcessFrame(&ssm_state, normalized_frame, NULL);
 		}
 
+		static float32_t pooled_embedding[SSM_D_MODEL] __attribute__((aligned(32)));
+		SSMBackbone_GetPooled(&ssm_state, pooled_embedding);
+
+#if SSM_SEND_LOGMEL_DEBUG
 		uint8_t resp_header[8];
 		resp_header[0] = (uint8_t) (LOGMEL_RESPONSE_MAGIC & 0xFF);
 		resp_header[1] = (uint8_t) ((LOGMEL_RESPONSE_MAGIC >> 8) & 0xFF);
@@ -206,6 +220,26 @@ int main(void) {
 				(int32_t) ((payload_bytes + 31u) & ~31u));
 		if (TransmitAcked((uint8_t*) logmel_output, payload_bytes) != HAL_OK) {
 			FatalBlink(LED_RED, 1);
+		}
+#endif
+
+		uint8_t emb_header[8];
+		emb_header[0] = (uint8_t) (EMBEDDING_RESPONSE_MAGIC & 0xFF);
+		emb_header[1] = (uint8_t) ((EMBEDDING_RESPONSE_MAGIC >> 8) & 0xFF);
+		emb_header[2] = (uint8_t) ((EMBEDDING_RESPONSE_MAGIC >> 16) & 0xFF);
+		emb_header[3] = (uint8_t) ((EMBEDDING_RESPONSE_MAGIC >> 24) & 0xFF);
+		emb_header[4] = (uint8_t) (SSM_D_MODEL & 0xFF);
+		emb_header[5] = (uint8_t) ((SSM_D_MODEL >> 8) & 0xFF);
+		emb_header[6] = 0;
+		emb_header[7] = 0;
+
+		if (HAL_UART_Transmit(&hcom_uart[COM1], emb_header, sizeof(emb_header), 2000) != HAL_OK) {
+		    FatalBlink(LED_RED, 3);
+		}
+		SCB_CleanDCache_by_Addr((uint32_t*) pooled_embedding,
+		        (int32_t) ((SSM_D_MODEL * sizeof(float32_t) + 31u) & ~31u));
+		if (TransmitAcked((uint8_t*) pooled_embedding, SSM_D_MODEL * sizeof(float32_t)) != HAL_OK) {
+		    FatalBlink(LED_RED, 1);
 		}
 
 		BSP_LED_Off(LED_GREEN); /* done -- back to waiting for the next clip */
