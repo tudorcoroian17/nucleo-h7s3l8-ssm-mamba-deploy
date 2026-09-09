@@ -14,7 +14,7 @@ typedef struct {
     const float *x_proj_w;    /* [DT_RANK+2*D_STATE][D_INNER] */
     const float *dt_proj_w;   /* [D_INNER][DT_RANK] */
     const float *dt_proj_b;   /* [D_INNER] */
-    const float *A_log;       /* [D_INNER][D_STATE] */
+    const float *A;           /* [D_INNER][D_STATE], precomputed -exp(A_log) */
     const float *D;           /* [D_INNER] */
     const float *out_proj_w;  /* [D_MODEL][D_INNER] */
     const float *norm_w;      /* [D_MODEL] */

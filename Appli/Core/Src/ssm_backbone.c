@@ -102,14 +102,13 @@ static void ssm_block_step(
 	/* 	euler discretize + recurrence + output, fused per timestep -- matches
 	 * 	ssm_block.py's discretize(discretization="euler") +
 	 * 	_scan_streaming(): A_bar = 1 + clamp(delta*A, min=-1.9),
-	 * 	B_bar = delta*B. A_log is small enough (D_INNER*D_STATE floats) that
-	 * 	recomputing exp() per step here is simpler than precomputing A once;
+	 * 	B_bar = delta*B. A is precomputed once by the export script, not
+	 * 	recomputed here — see export_ssm_weights.py's precomputed_A();
 	 * 	the two D_MODEL x D_INNER matmuls above dominate per-frame cost. */
 	for (int c = 0; c < SSM_D_INNER; c++) {
 		float y_c = 0.0f;
 		for (int n = 0; n < SSM_D_STATE; n++) {
-			float A_cn = -expf(w->A_log[c * SSM_D_STATE + n]);
-			float deltaA = delta[c] * A_cn;
+			float deltaA = delta[c] * w->A[c * SSM_D_STATE + n];
 			if (deltaA < -1.9f) {
 				deltaA = -1.9f;
 			}

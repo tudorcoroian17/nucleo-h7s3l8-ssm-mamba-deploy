@@ -95,7 +95,9 @@ int main(void) {
 	HAL_Init();
 
 	/* USER CODE BEGIN Init */
-
+	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+	DWT->CYCCNT = 0;
+	DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 	/* USER CODE END Init */
 
 	/* USER CODE BEGIN SysInit */
@@ -163,6 +165,10 @@ int main(void) {
 		static SSMBackbone_State ssm_state __attribute__((section(".ssm_state_dtcm")));
 		SSMBackbone_Reset(&ssm_state);
 
+		uint32_t feature_cycles_total = 0;
+		uint32_t normalize_cycles_total = 0;
+		uint32_t backbone_cycles_total = 0;
+
 		uint32_t num_full_hops = num_samples / MEL_HOP_LENGTH;
 		uint32_t leftover = num_samples - (num_full_hops * MEL_HOP_LENGTH);
 		uint32_t num_frames = num_full_hops + 1;
@@ -186,12 +192,20 @@ int main(void) {
 				}
 			}
 
+			uint32_t t0 = DWT->CYCCNT;
 			FeaturePipeline_PushHop(hop_f32);
 			FeaturePipeline_ComputeLogMelFrame(FeaturePipeline_GetCurrentFrame(), logmel_output[h]);
+			uint32_t t1 = DWT->CYCCNT;
+			feature_cycles_total += (t1 - t0);
 
 			float32_t normalized_frame[SSM_D_MODEL];
 			SSMBackbone_NormalizeFrame(logmel_output[h], normalized_frame);
+			uint32_t t2 = DWT->CYCCNT;
+			normalize_cycles_total += (t2 - t1);
+
 			SSMBackbone_ProcessFrame(&ssm_state, normalized_frame, NULL);
+			uint32_t t3 = DWT->CYCCNT;
+			backbone_cycles_total += (t3 - t2);
 		}
 
 		static float32_t pooled_embedding[SSM_D_MODEL] __attribute__((aligned(32)));
@@ -243,6 +257,17 @@ int main(void) {
 		}
 
 		BSP_LED_Off(LED_GREEN); /* done -- back to waiting for the next clip */
+
+		printf("frames=%lu feature=%lu cyc (%.2f ms) normalize=%lu cyc backbone=%lu cyc (%.2f ms) "
+		       "backbone/frame=%.0f cyc (%.1f us, budget 32000 us)\r\n",
+		       (unsigned long) num_frames,
+		       (unsigned long) feature_cycles_total,
+		       (double) feature_cycles_total / SystemCoreClock * 1000.0,
+		       (unsigned long) normalize_cycles_total,
+		       (unsigned long) backbone_cycles_total,
+		       (double) backbone_cycles_total / SystemCoreClock * 1000.0,
+		       (double) backbone_cycles_total / num_frames,
+		       (double) backbone_cycles_total / num_frames / SystemCoreClock * 1e6);
 	}
 	/* USER CODE END WHILE */
 
