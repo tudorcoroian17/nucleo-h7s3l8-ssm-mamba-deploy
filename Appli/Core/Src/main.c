@@ -34,13 +34,13 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define LOGMEL_RESPONSE_MAGIC 0x4C4D454Cu		/* "LMEL" */
 #define EMBEDDING_RESPONSE_MAGIC 0x454D4245u  	/* "EMBE" */
-#define LOGMEL_MAX_FRAMES ((AUDIO_INGEST_MAX_SAMPLES / MEL_HOP_LENGTH) + 1)
 #define UART_TX_CHUNK_SIZE 4096u
-#define UART_TX_CHUNK_DELAY_MS 150
 
-#define SSM_SEND_LOGMEL_DEBUG 1  /* 0 once backbone parity is established */
+/* Upper bound on accepted clip length, in samples. Was the size of the
+ * removed clip_buffer; now purely a sanity check on the stream header --
+ * nothing this large is ever buffered. ~11 s at 16 kHz. */
+#define AUDIO_MAX_SAMPLES 180000u
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -52,11 +52,13 @@
 
 COM_InitTypeDef BspCOMInit;
 
+DMA_HandleTypeDef handle_GPDMA1_Channel5;
+
 /* USER CODE BEGIN PV */
-static int16_t clip_buffer[AUDIO_INGEST_MAX_SAMPLES];
-static float32_t logmel_output[LOGMEL_MAX_FRAMES][MEL_N_MELS] __attribute__((aligned(32)));
 /* USER CODE END PV */
+
 /* Private function prototypes -----------------------------------------------*/
+static void MX_GPDMA1_Init(void);
 /* USER CODE BEGIN PFP */
 static void FatalBlink(Led_TypeDef led, uint32_t count);
 static HAL_StatusTypeDef TransmitAcked(const uint8_t *data,
@@ -105,6 +107,7 @@ int main(void) {
 	/* USER CODE END SysInit */
 
 	/* Initialize all configured peripherals */
+	MX_GPDMA1_Init();
 	/* USER CODE BEGIN 2 */
 	FeaturePipeline_Init();
 	/* USER CODE END 2 */
@@ -126,116 +129,100 @@ int main(void) {
 	if (BSP_COM_Init(COM1, &BspCOMInit) != BSP_ERROR_NONE) {
 		Error_Handler();
 	}
+	/* Attach the GPDMA channel to COM1's UART handle. BSP_COM_Init() above
+	 * initializes hcom_uart[COM1] independently of CubeMX/GPDMA -- this is
+	 * the one line that connects the two, since CubeMX can't generate this
+	 * link itself for a BSP-controlled peripheral. */
+	__HAL_LINKDMA(&hcom_uart[COM1], hdmarx, handle_GPDMA1_Channel5);
 
 	/* Infinite loop */
 	/* USER CODE BEGIN WHILE */
 	while (1) {
 		printf("Waiting for clip...\r\n");
-		uint32_t num_samples = AudioIngest_ReceiveClip(clip_buffer,
-				AUDIO_INGEST_MAX_SAMPLES);
+		uint32_t num_hops = AudioIngest_ReceiveClipHeader(AUDIO_MAX_SAMPLES);
 
-		if (num_samples == 0) {
+		if (num_hops == 0) {
 			continue;
 		}
 
-		/* Clear any error flags latched during the long polled receive. An
-		 * overrun (ORE) can set during the clip upload without failing that
-		 * call, then cause the next HAL_UART_Receive to return HAL_ERROR
-		 * immediately. */
+		/* Clear any error flags latched during the header receive. An overrun
+		 * (ORE) can set without failing that call, then cause the next
+		 * HAL_UART_Receive to return HAL_ERROR immediately. */
 		__HAL_UART_CLEAR_OREFLAG(&hcom_uart[COM1]);
 		__HAL_UART_CLEAR_NEFLAG(&hcom_uart[COM1]);
 		__HAL_UART_CLEAR_FEFLAG(&hcom_uart[COM1]);
 		__HAL_UART_CLEAR_PEFLAG(&hcom_uart[COM1]);
 		hcom_uart[COM1].ErrorCode = HAL_UART_ERROR_NONE;
 
-		/* Drain any bytes the PC sent beyond what the clip receive consumed.
-		 * These would otherwise be returned in place of the first ACK. */
-		{
-			uint8_t discard;
-			while (HAL_UART_Receive(&hcom_uart[COM1], &discard, 1, 200)
-					== HAL_OK) {
-				/* keep reading until 200 ms passes with nothing arriving */
-			}
-			__HAL_UART_CLEAR_OREFLAG(&hcom_uart[COM1]);
-			hcom_uart[COM1].ErrorCode = HAL_UART_ERROR_NONE;
-		}
-
 		BSP_LED_On(LED_GREEN); /* solid: processing and responding */
 
 		static SSMBackbone_State ssm_state __attribute__((section(".ssm_state_dtcm")));
 		SSMBackbone_Reset(&ssm_state);
 
+		static int16_t hop_buf[2][AUDIO_INGEST_HOP_SAMPLES] __attribute__((aligned(32)));
+		uint32_t active = 0;
+
 		uint32_t feature_cycles_total = 0;
 		uint32_t normalize_cycles_total = 0;
 		uint32_t backbone_cycles_total = 0;
+		int rx_failed = 0;
 
-		uint32_t num_full_hops = num_samples / MEL_HOP_LENGTH;
-		uint32_t leftover = num_samples - (num_full_hops * MEL_HOP_LENGTH);
-		uint32_t num_frames = num_full_hops + 1;
+		if (AudioIngest_StartHopReceive(hop_buf[0]) != HAL_OK) {
+			rx_failed = 1;
+		}
 
-		/* Compute every frame into RAM first. The actual transmission below
-		 * is then one uninterrupted burst -- the same shape as the clip
-		 * upload, which has been reliable every time -- instead of many
-		 * small gapped bursts, which have not. */
-		for (uint32_t h = 0; h < num_frames; h++) {
-			float32_t hop_f32[MEL_HOP_LENGTH] = { 0 };
+		for (uint32_t h = 0; h < num_hops && !rx_failed; h++) {
+			if (AudioIngest_WaitHopComplete(hop_buf[active], 2000) != HAL_OK) {
+				rx_failed = 1;
+				break;
+			}
 
-			if (h < num_full_hops) {
-				for (uint32_t i = 0; i < MEL_HOP_LENGTH; i++) {
-					hop_f32[i] = (float32_t) clip_buffer[h * MEL_HOP_LENGTH + i]
-							/ 32768.0f;
+			if (h + 1 < num_hops) {
+				if (AudioIngest_StartHopReceive(hop_buf[1 - active])
+						!= HAL_OK) {
+					rx_failed = 1;
+					break;
 				}
-			} else {
-				for (uint32_t i = 0; i < leftover; i++) {
-					hop_f32[i] = (float32_t) clip_buffer[h * MEL_HOP_LENGTH + i]
-							/ 32768.0f;
-				}
+			}
+
+			float32_t hop_f32[AUDIO_INGEST_HOP_SAMPLES];
+			for (uint32_t i = 0; i < AUDIO_INGEST_HOP_SAMPLES; i++) {
+				hop_f32[i] = (float32_t) hop_buf[active][i] / 32768.0f;
 			}
 
 			uint32_t t0 = DWT->CYCCNT;
 			FeaturePipeline_PushHop(hop_f32);
-			FeaturePipeline_ComputeLogMelFrame(FeaturePipeline_GetCurrentFrame(), logmel_output[h]);
+			float32_t logmel_frame[MEL_N_MELS];
+			FeaturePipeline_ComputeLogMelFrame(
+					FeaturePipeline_GetCurrentFrame(), logmel_frame);
 			uint32_t t1 = DWT->CYCCNT;
 			feature_cycles_total += (t1 - t0);
 
 			float32_t normalized_frame[SSM_D_MODEL];
-			SSMBackbone_NormalizeFrame(logmel_output[h], normalized_frame);
+			SSMBackbone_NormalizeFrame(logmel_frame, normalized_frame);
 			uint32_t t2 = DWT->CYCCNT;
 			normalize_cycles_total += (t2 - t1);
 
 			SSMBackbone_ProcessFrame(&ssm_state, normalized_frame, NULL);
 			uint32_t t3 = DWT->CYCCNT;
 			backbone_cycles_total += (t3 - t2);
+
+			active = 1 - active;
+		}
+
+		if (rx_failed) {
+			/* A hop failed to arrive, possibly mid-DMA-transfer. Without this,
+			 * the UART is left marked busy, and every subsequent header
+			 * receive fails instantly instead of timing out normally --
+			 * producing an unthrottled retry loop instead of a paced one. */
+			HAL_UART_AbortReceive(&hcom_uart[COM1]);
+			BSP_LED_Off(LED_GREEN);
+			printf("RXFAIL: hop receive failed, abandoning clip\r\n");
+			continue;
 		}
 
 		static float32_t pooled_embedding[SSM_D_MODEL] __attribute__((aligned(32)));
 		SSMBackbone_GetPooled(&ssm_state, pooled_embedding);
-
-#if SSM_SEND_LOGMEL_DEBUG
-		uint8_t resp_header[8];
-		resp_header[0] = (uint8_t) (LOGMEL_RESPONSE_MAGIC & 0xFF);
-		resp_header[1] = (uint8_t) ((LOGMEL_RESPONSE_MAGIC >> 8) & 0xFF);
-		resp_header[2] = (uint8_t) ((LOGMEL_RESPONSE_MAGIC >> 16) & 0xFF);
-		resp_header[3] = (uint8_t) ((LOGMEL_RESPONSE_MAGIC >> 24) & 0xFF);
-		resp_header[4] = (uint8_t) (num_frames & 0xFF);
-		resp_header[5] = (uint8_t) ((num_frames >> 8) & 0xFF);
-		resp_header[6] = (uint8_t) ((num_frames >> 16) & 0xFF);
-		resp_header[7] = (uint8_t) ((num_frames >> 24) & 0xFF);
-
-		if (HAL_UART_Transmit(&hcom_uart[COM1], resp_header,
-				sizeof(resp_header), 2000) != HAL_OK) {
-			FatalBlink(LED_RED, 3);
-		}
-
-		uint32_t payload_bytes = num_frames * MEL_N_MELS * sizeof(float32_t);
-		/* Flush the computed frames out of D-Cache to physical AXI SRAM before
-		 * the UART reads them. Address and size must be 32-byte aligned. */
-		SCB_CleanDCache_by_Addr((uint32_t*) logmel_output,
-				(int32_t) ((payload_bytes + 31u) & ~31u));
-		if (TransmitAcked((uint8_t*) logmel_output, payload_bytes) != HAL_OK) {
-			FatalBlink(LED_RED, 1);
-		}
-#endif
 
 		uint8_t emb_header[8];
 		emb_header[0] = (uint8_t) (EMBEDDING_RESPONSE_MAGIC & 0xFF);
@@ -247,33 +234,95 @@ int main(void) {
 		emb_header[6] = 0;
 		emb_header[7] = 0;
 
-		if (HAL_UART_Transmit(&hcom_uart[COM1], emb_header, sizeof(emb_header), 2000) != HAL_OK) {
-		    FatalBlink(LED_RED, 3);
+		if (HAL_UART_Transmit(&hcom_uart[COM1], emb_header, sizeof(emb_header),
+				2000) != HAL_OK) {
+			FatalBlink(LED_RED, 3);
 		}
 		SCB_CleanDCache_by_Addr((uint32_t*) pooled_embedding,
-		        (int32_t) ((SSM_D_MODEL * sizeof(float32_t) + 31u) & ~31u));
-		if (TransmitAcked((uint8_t*) pooled_embedding, SSM_D_MODEL * sizeof(float32_t)) != HAL_OK) {
-		    FatalBlink(LED_RED, 1);
+				(int32_t) ((SSM_D_MODEL * sizeof(float32_t) + 31u) & ~31u));
+		if (TransmitAcked((uint8_t*) pooled_embedding,
+		SSM_D_MODEL * sizeof(float32_t)) != HAL_OK) {
+			FatalBlink(LED_RED, 1);
 		}
 
 		BSP_LED_Off(LED_GREEN); /* done -- back to waiting for the next clip */
 
-		printf("frames=%lu feature=%lu cyc (%.2f ms) normalize=%lu cyc backbone=%lu cyc (%.2f ms) "
-		       "backbone/frame=%.0f cyc (%.1f us, budget 32000 us)\r\n",
-		       (unsigned long) num_frames,
-		       (unsigned long) feature_cycles_total,
-		       (double) feature_cycles_total / SystemCoreClock * 1000.0,
-		       (unsigned long) normalize_cycles_total,
-		       (unsigned long) backbone_cycles_total,
-		       (double) backbone_cycles_total / SystemCoreClock * 1000.0,
-		       (double) backbone_cycles_total / num_frames,
-		       (double) backbone_cycles_total / num_frames / SystemCoreClock * 1e6);
+		printf(
+				"hops=%lu feature=%lu cyc (%.2f ms) normalize=%lu cyc backbone=%lu cyc (%.2f ms) "
+						"backbone/frame=%.0f cyc (%.1f us, budget 32000 us)\r\n",
+				(unsigned long) num_hops, (unsigned long) feature_cycles_total,
+				(double) feature_cycles_total / SystemCoreClock * 1000.0,
+				(unsigned long) normalize_cycles_total,
+				(unsigned long) backbone_cycles_total,
+				(double) backbone_cycles_total / SystemCoreClock * 1000.0,
+				(double) backbone_cycles_total / num_hops,
+				(double) backbone_cycles_total / num_hops / SystemCoreClock
+						* 1e6);
 	}
 	/* USER CODE END WHILE */
 
 	/* USER CODE BEGIN 3 */
 }
 /* USER CODE END 3 */
+
+/**
+ * @brief GPDMA1 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_GPDMA1_Init(void) {
+
+	/* USER CODE BEGIN GPDMA1_Init 0 */
+
+	/* USER CODE END GPDMA1_Init 0 */
+
+	/* Peripheral clock enable */
+	__HAL_RCC_GPDMA1_CLK_ENABLE();
+
+	/* GPDMA1 interrupt Init */
+	HAL_NVIC_SetPriority(GPDMA1_Channel5_IRQn, 0, 0);
+	HAL_NVIC_EnableIRQ(GPDMA1_Channel5_IRQn);
+
+	/* USER CODE BEGIN GPDMA1_Init 1 */
+
+	/* USER CODE END GPDMA1_Init 1 */
+	handle_GPDMA1_Channel5.Instance = GPDMA1_Channel5;
+	handle_GPDMA1_Channel5.Init.Request = DMA_REQUEST_SW;
+	handle_GPDMA1_Channel5.Init.BlkHWRequest = DMA_BREQ_SINGLE_BURST;
+	handle_GPDMA1_Channel5.Init.Direction = DMA_MEMORY_TO_MEMORY;
+	handle_GPDMA1_Channel5.Init.SrcInc = DMA_SINC_FIXED;
+	handle_GPDMA1_Channel5.Init.DestInc = DMA_DINC_FIXED;
+	handle_GPDMA1_Channel5.Init.SrcDataWidth = DMA_SRC_DATAWIDTH_BYTE;
+	handle_GPDMA1_Channel5.Init.DestDataWidth = DMA_DEST_DATAWIDTH_BYTE;
+	handle_GPDMA1_Channel5.Init.Priority = DMA_LOW_PRIORITY_LOW_WEIGHT;
+	handle_GPDMA1_Channel5.Init.SrcBurstLength = 1;
+	handle_GPDMA1_Channel5.Init.DestBurstLength = 1;
+	handle_GPDMA1_Channel5.Init.TransferAllocatedPort = DMA_SRC_ALLOCATED_PORT0
+			| DMA_DEST_ALLOCATED_PORT0;
+	handle_GPDMA1_Channel5.Init.TransferEventMode = DMA_TCEM_BLOCK_TRANSFER;
+	handle_GPDMA1_Channel5.Init.Mode = DMA_NORMAL;
+	if (HAL_DMA_Init(&handle_GPDMA1_Channel5) != HAL_OK) {
+		Error_Handler();
+	}
+	if (HAL_DMA_ConfigChannelAttributes(&handle_GPDMA1_Channel5,
+	DMA_CHANNEL_NPRIV) != HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE BEGIN GPDMA1_Init 2 */
+	/* CubeMX cannot resolve a Request for USART3 (it's BSP-controlled, outside
+	 * CubeMX's peripheral model), so the generated Init above defaults to a
+	 * software-triggered memory-to-memory copy. Correct it here instead of
+	 * editing the generated lines directly, since this block survives
+	 * regeneration and those don't. */
+	handle_GPDMA1_Channel5.Init.Request = GPDMA1_REQUEST_USART3_RX;
+	handle_GPDMA1_Channel5.Init.Direction = DMA_PERIPH_TO_MEMORY;
+	handle_GPDMA1_Channel5.Init.DestInc = DMA_DINC_INCREMENTED;
+	if (HAL_DMA_Init(&handle_GPDMA1_Channel5) != HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE END GPDMA1_Init 2 */
+
+}
 
 /* USER CODE BEGIN 4 */
 static void FatalBlink(Led_TypeDef led, uint32_t count) {

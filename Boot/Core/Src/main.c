@@ -44,6 +44,8 @@
 
 COM_InitTypeDef BspCOMInit;
 
+DMA_HandleTypeDef handle_GPDMA1_Channel5;
+
 XSPI_HandleTypeDef hxspi2;
 
 /* USER CODE BEGIN PV */
@@ -54,6 +56,7 @@ XSPI_HandleTypeDef hxspi2;
 void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_GPDMA1_Init(void);
 static void MX_SBS_Init(void);
 static void MX_XSPI2_Init(void);
 /* USER CODE BEGIN PFP */
@@ -72,7 +75,7 @@ static void MX_XSPI2_Init(void);
 int main(void)
 {
 
-	  /* USER CODE BEGIN 1 */
+  /* USER CODE BEGIN 1 */
 	  __HAL_RCC_GPIOD_CLK_ENABLE();
 	  GPIO_InitTypeDef diag_gpio = {0};
 	  diag_gpio.Pin   = GPIO_PIN_10;
@@ -81,7 +84,7 @@ int main(void)
 	  diag_gpio.Speed = GPIO_SPEED_FREQ_LOW;
 	  HAL_GPIO_Init(GPIOD, &diag_gpio);
 	  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_10, GPIO_PIN_SET);
-	  /* USER CODE END 1 */
+  /* USER CODE END 1 */
 
   /* MPU Configuration--------------------------------------------------------*/
   MPU_Config();
@@ -112,6 +115,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_GPDMA1_Init();
   MX_SBS_Init();
   MX_XSPI2_Init();
   MX_EXTMEM_MANAGER_Init();
@@ -139,10 +143,7 @@ int main(void)
   }
 
   /* Launch the application */
-  printf("Boot: reached BOOT_Application()\r\n");
-  BOOTStatus_TypeDef boot_status = BOOT_Application();
-  printf("Boot: BOOT_Application returned, status=%d (should never print if it jumped)\r\n", (int)boot_status);
-  if (BOOT_OK != boot_status)
+  if (BOOT_OK != BOOT_Application())
   {
     Error_Handler();
   }
@@ -224,6 +225,63 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief GPDMA1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPDMA1_Init(void)
+{
+
+  /* USER CODE BEGIN GPDMA1_Init 0 */
+
+  /* USER CODE END GPDMA1_Init 0 */
+
+  /* Peripheral clock enable */
+  __HAL_RCC_GPDMA1_CLK_ENABLE();
+
+  /* USER CODE BEGIN GPDMA1_Init 1 */
+
+  /* USER CODE END GPDMA1_Init 1 */
+  handle_GPDMA1_Channel5.Instance = GPDMA1_Channel5;
+  handle_GPDMA1_Channel5.Init.Request = DMA_REQUEST_SW;
+  handle_GPDMA1_Channel5.Init.BlkHWRequest = DMA_BREQ_SINGLE_BURST;
+  handle_GPDMA1_Channel5.Init.Direction = DMA_MEMORY_TO_MEMORY;
+  handle_GPDMA1_Channel5.Init.SrcInc = DMA_SINC_FIXED;
+  handle_GPDMA1_Channel5.Init.DestInc = DMA_DINC_FIXED;
+  handle_GPDMA1_Channel5.Init.SrcDataWidth = DMA_SRC_DATAWIDTH_BYTE;
+  handle_GPDMA1_Channel5.Init.DestDataWidth = DMA_DEST_DATAWIDTH_BYTE;
+  handle_GPDMA1_Channel5.Init.Priority = DMA_LOW_PRIORITY_LOW_WEIGHT;
+  handle_GPDMA1_Channel5.Init.SrcBurstLength = 1;
+  handle_GPDMA1_Channel5.Init.DestBurstLength = 1;
+  handle_GPDMA1_Channel5.Init.TransferAllocatedPort = DMA_SRC_ALLOCATED_PORT0|DMA_DEST_ALLOCATED_PORT0;
+  handle_GPDMA1_Channel5.Init.TransferEventMode = DMA_TCEM_BLOCK_TRANSFER;
+  handle_GPDMA1_Channel5.Init.Mode = DMA_NORMAL;
+  if (HAL_DMA_Init(&handle_GPDMA1_Channel5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_DMA_ConfigChannelAttributes(&handle_GPDMA1_Channel5, DMA_CHANNEL_NPRIV) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN GPDMA1_Init 2 */
+  /* CubeMX cannot resolve a Request for USART3 (it's BSP-controlled, outside
+   * CubeMX's peripheral model), so the generated Init above defaults to a
+   * software-triggered memory-to-memory copy. Correct it here instead of
+   * editing the generated lines directly, since this block survives
+   * regeneration and those don't. */
+  handle_GPDMA1_Channel5.Init.Request = DMA_REQUEST_USART3_RX;
+  handle_GPDMA1_Channel5.Init.Direction = DMA_PERIPH_TO_MEMORY;
+  handle_GPDMA1_Channel5.Init.DestInc = DMA_DINC_INCREMENTED;
+  if (HAL_DMA_Init(&handle_GPDMA1_Channel5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE END GPDMA1_Init 2 */
+
 }
 
 /**

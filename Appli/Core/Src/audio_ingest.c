@@ -3,32 +3,15 @@
 #include "stm32h7rsxx_nucleo.h"
 
 #define UART_RX_TIMEOUT_MS 5000
-#define UART_RX_CHUNK_SIZE 4096u
 
-static HAL_StatusTypeDef ReceiveChunked(uint8_t *dest, uint32_t total_bytes,
-		uint32_t chunk_timeout_ms) {
-	uint32_t offset = 0;
-	while (offset < total_bytes) {
-		uint32_t chunk =
-				(total_bytes - offset < UART_RX_CHUNK_SIZE) ?
-						(total_bytes - offset) : UART_RX_CHUNK_SIZE;
+static volatile uint8_t hop_rx_complete = 0;
+static volatile uint8_t hop_rx_error = 0;
 
-		/* HAL's Size parameter is uint16_t. Any single call above 65535 bytes
-		 * silently truncates modulo 65536 and still returns HAL_OK. */
-		if (HAL_UART_Receive(&hcom_uart[COM1], &dest[offset], (uint16_t) chunk,
-				chunk_timeout_ms) != HAL_OK) {
-			return HAL_ERROR;
-		}
-		offset += chunk;
-	}
-	return HAL_OK;
-}
-
-uint32_t AudioIngest_ReceiveClip(int16_t *out_buffer, uint32_t max_samples) {
+uint32_t AudioIngest_ReceiveClipHeader(uint32_t max_samples) {
 	uint8_t header[8];
 
 	if (HAL_UART_Receive(&hcom_uart[COM1], header, sizeof(header),
-			UART_RX_TIMEOUT_MS) != HAL_OK) {
+	UART_RX_TIMEOUT_MS) != HAL_OK) {
 		return 0;
 	}
 
@@ -44,13 +27,45 @@ uint32_t AudioIngest_ReceiveClip(int16_t *out_buffer, uint32_t max_samples) {
 		return 0;
 	}
 
-	/*	Cortex-M7 on this board is little-endian, matching the wire format, so
-	 *	a direct byte-for-byte receive into the int16_t buffer is correct
-	 *	as-is -- no byte-swapping needed. */
-	if (ReceiveChunked((uint8_t*) out_buffer, num_samples * sizeof(int16_t),
-			UART_RX_TIMEOUT_MS) != HAL_OK) {
-		return 0;
+	uint32_t num_hops = (num_samples + AUDIO_INGEST_HOP_SAMPLES - 1u)
+			/ AUDIO_INGEST_HOP_SAMPLES;
+
+	return num_hops;
+}
+
+HAL_StatusTypeDef AudioIngest_StartHopReceive(int16_t *out_hop) {
+	hop_rx_complete = 0;
+	hop_rx_error = 0;
+	return HAL_UART_Receive_DMA(&hcom_uart[COM1], (uint8_t*) out_hop,
+			AUDIO_INGEST_HOP_SAMPLES * sizeof(int16_t));
+}
+
+HAL_StatusTypeDef AudioIngest_WaitHopComplete(int16_t *out_hop,
+		uint32_t timeout_ms) {
+	uint32_t start = HAL_GetTick();
+	while (!hop_rx_complete && !hop_rx_error) {
+		if ((HAL_GetTick() - start) > timeout_ms) {
+			return HAL_TIMEOUT;
+		}
+	}
+	if (hop_rx_error) {
+		return HAL_ERROR;
 	}
 
-	return num_samples;
+	SCB_InvalidateDCache_by_Addr((uint32_t*) out_hop,
+			(int32_t) (AUDIO_INGEST_HOP_SAMPLES * sizeof(int16_t)));
+
+	return HAL_OK;
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+	if (huart == &hcom_uart[COM1]) {
+		hop_rx_complete = 1;
+	}
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+	if (huart == &hcom_uart[COM1]) {
+		hop_rx_error = 1;
+	}
 }
