@@ -25,6 +25,7 @@
 #include "feature_pipeline.h"
 #include "audio_ingest.h"
 #include "ssm_backbone.h"
+#include "ssm_distance_head.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,6 +36,8 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define EMBEDDING_RESPONSE_MAGIC 0x454D4245u  	/* "EMBE" */
+#define HEAD_RESPONSE_MAGIC 0x44414548u        /* "HEAD" */
+#define TIMING_RESPONSE_MAGIC 0x454D4954u      /* "TIME" */
 #define UART_TX_CHUNK_SIZE 4096u
 
 /* Upper bound on accepted clip length, in samples. Was the size of the
@@ -224,6 +227,18 @@ int main(void) {
 		static float32_t pooled_embedding[SSM_D_MODEL] __attribute__((aligned(32)));
 		SSMBackbone_GetPooled(&ssm_state, pooled_embedding);
 
+		/* Scheme-agnostic: SSMHeadResult's exact size differs between the
+		 * float-only schemes (weight-only, weight+activation-boundaries)
+		 * and true_int8 (which adds bonus int32 sumsq fields) -- this line
+		 * doesn't need to know or care which one is linked in, since
+		 * ssm_distance_head.h always declares the same struct name and
+		 * function name (see mcu/ssm_head_src/ vs
+		 * mcu/ssm_head_src_true_int8/'s shared public API). */
+		static SSMHeadResult head_result __attribute__((aligned(32)));
+		uint32_t t_head0 = DWT->CYCCNT;
+		SSMDistanceHead_Score(pooled_embedding, &head_result);
+		uint32_t head_cycles = DWT->CYCCNT - t_head0;
+
 		uint8_t emb_header[8];
 		emb_header[0] = (uint8_t) (EMBEDDING_RESPONSE_MAGIC & 0xFF);
 		emb_header[1] = (uint8_t) ((EMBEDDING_RESPONSE_MAGIC >> 8) & 0xFF);
@@ -245,11 +260,74 @@ int main(void) {
 			FatalBlink(LED_RED, 1);
 		}
 
+		/* Second, separate packet: the head-scoring result. Deliberately
+		 * additive, not a replacement for the embedding packet above --
+		 * check_backbone_parity.py and every existing capture tool built
+		 * against EMBEDDING_RESPONSE_MAGIC keeps working unchanged. Payload
+		 * length is sizeof(head_result), read from this header rather than
+		 * hardcoded, so a host-side parser can size its receive buffer
+		 * correctly regardless of which scheme's SSMHeadResult (float-only
+		 * vs true_int8's superset) this build was compiled against. */
+		uint8_t head_header[8];
+		head_header[0] = (uint8_t) (HEAD_RESPONSE_MAGIC & 0xFF);
+		head_header[1] = (uint8_t) ((HEAD_RESPONSE_MAGIC >> 8) & 0xFF);
+		head_header[2] = (uint8_t) ((HEAD_RESPONSE_MAGIC >> 16) & 0xFF);
+		head_header[3] = (uint8_t) ((HEAD_RESPONSE_MAGIC >> 24) & 0xFF);
+		head_header[4] = (uint8_t) (sizeof(head_result) & 0xFF);
+		head_header[5] = (uint8_t) ((sizeof(head_result) >> 8) & 0xFF);
+		head_header[6] = 0;
+		head_header[7] = 0;
+
+		if (HAL_UART_Transmit(&hcom_uart[COM1], head_header,
+				sizeof(head_header), 2000) != HAL_OK) {
+			FatalBlink(LED_RED, 3);
+		}
+		SCB_CleanDCache_by_Addr((uint32_t*) &head_result,
+				(int32_t) ((sizeof(head_result) + 31u) & ~31u));
+		if (TransmitAcked((uint8_t*) &head_result, sizeof(head_result))
+				!= HAL_OK) {
+			FatalBlink(LED_RED, 2);
+		}
+
+		/* Third, separate packet: per-clip timing. Fixed 4-uint32 layout
+		 * regardless of scheme -- feature/normalize/backbone are already
+		 * accumulated across every hop of this clip (matches how they're
+		 * printed below); head_cycles is the single SSMDistanceHead_Score
+		 * call timed just above, since it runs once per clip, not once
+		 * per frame. */
+		static uint32_t timing_values[4] __attribute__((aligned(32)));
+		timing_values[0] = feature_cycles_total;
+		timing_values[1] = normalize_cycles_total;
+		timing_values[2] = backbone_cycles_total;
+		timing_values[3] = head_cycles;
+
+		uint8_t timing_header[8];
+		timing_header[0] = (uint8_t) (TIMING_RESPONSE_MAGIC & 0xFF);
+		timing_header[1] = (uint8_t) ((TIMING_RESPONSE_MAGIC >> 8) & 0xFF);
+		timing_header[2] = (uint8_t) ((TIMING_RESPONSE_MAGIC >> 16) & 0xFF);
+		timing_header[3] = (uint8_t) ((TIMING_RESPONSE_MAGIC >> 24) & 0xFF);
+		timing_header[4] = (uint8_t) (sizeof(timing_values) & 0xFF);
+		timing_header[5] = (uint8_t) ((sizeof(timing_values) >> 8) & 0xFF);
+		timing_header[6] = 0;
+		timing_header[7] = 0;
+
+		if (HAL_UART_Transmit(&hcom_uart[COM1], timing_header,
+				sizeof(timing_header), 2000) != HAL_OK) {
+			FatalBlink(LED_RED, 3);
+		}
+		SCB_CleanDCache_by_Addr((uint32_t*) timing_values,
+				(int32_t) ((sizeof(timing_values) + 31u) & ~31u));
+		if (TransmitAcked((uint8_t*) timing_values, sizeof(timing_values))
+				!= HAL_OK) {
+			FatalBlink(LED_RED, 4);
+		}
+
 		BSP_LED_Off(LED_GREEN); /* done -- back to waiting for the next clip */
 
 		printf(
 				"hops=%lu feature=%lu cyc (%.2f ms) normalize=%lu cyc backbone=%lu cyc (%.2f ms) "
-						"backbone/frame=%.0f cyc (%.1f us, budget 32000 us)\r\n",
+						"backbone/frame=%.0f cyc (%.1f us, budget 32000 us) head=%lu cyc "
+						"euclidean=%.4f (%u) knn16=%.4f (%u)\r\n",
 				(unsigned long) num_hops, (unsigned long) feature_cycles_total,
 				(double) feature_cycles_total / SystemCoreClock * 1000.0,
 				(unsigned long) normalize_cycles_total,
@@ -257,7 +335,11 @@ int main(void) {
 				(double) backbone_cycles_total / SystemCoreClock * 1000.0,
 				(double) backbone_cycles_total / num_hops,
 				(double) backbone_cycles_total / num_hops / SystemCoreClock
-						* 1e6);
+						* 1e6, (unsigned long) head_cycles,
+				(double) head_result.euclidean_score,
+				(unsigned int) head_result.euclidean_anomaly,
+				(double) head_result.knn16_score,
+				(unsigned int) head_result.knn16_anomaly);
 	}
 	/* USER CODE END WHILE */
 

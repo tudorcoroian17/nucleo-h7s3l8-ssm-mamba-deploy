@@ -13,8 +13,14 @@ static inline float ssm_silu(float x) {
 	return x / (1.0f + expf(-x));
 }
 
-static void ssm_rmsnorm(const float *x, const ssm_norm_weights_t *nw,
-		float *out) {
+static inline float ssm_quant_dequant(float v, float scale) {
+	float q = roundf(v / scale);
+	if (q > 127.0f) q = 127.0f;
+	if (q < -127.0f) q = -127.0f;
+	return q * scale;
+}
+
+static void ssm_rmsnorm(const float *x, const ssm_norm_weights_t *nw, float *out) {
 	float ss = 0.0f;
 	for (int i = 0; i < SSM_D_MODEL; i++) {
 		ss += x[i] * x[i];
@@ -25,9 +31,11 @@ static void ssm_rmsnorm(const float *x, const ssm_norm_weights_t *nw,
 	}
 }
 
-static void ssm_block_step(const ssm_block_weights_t *w,
+static void ssm_block_step(
+		const ssm_block_weights_t *w,
 		float h[SSM_D_INNER][SSM_D_STATE],
-		float conv_hist[SSM_D_INNER][SSM_D_CONV - 1], const float *x_norm,
+		float conv_hist[SSM_D_INNER][SSM_D_CONV - 1],
+		const float *x_norm,
 		float *block_out) {
 
 	float u_raw[SSM_D_INNER];
@@ -41,8 +49,8 @@ static void ssm_block_step(const ssm_block_weights_t *w,
 	float y[SSM_D_INNER];
 
 	/* in_proj: split into u_raw (rows 0..D_INNER-1) and z (rows D_INNER..).
-	 * Every weight read goes through SSM_IN_PROJ_W -- see ssm_weights.h for
-	 * which of the two ways it expands in this build. */
+	 * SSM_QUANT_Z is applied once z[] is fully computed -- boundaries group,
+	 * no-op when this scheme doesn't quantize activations. */
 	for (int o = 0; o < SSM_D_INNER; o++) {
 		float acc = 0.0f;
 		for (int i = 0; i < SSM_D_MODEL; i++) {
@@ -57,9 +65,14 @@ static void ssm_block_step(const ssm_block_weights_t *w,
 		}
 		z[o] = acc;
 	}
+	for (int o = 0; o < SSM_D_INNER; o++) {
+		z[o] = SSM_QUANT_Z(w, z[o]);
+	}
 
 	/*	causal depthwise conv: kernel tap 0 = oldest (t-3) .. tap 3 = current
-	 * 	(t), then SiLU. conv_hist holds t-3,t-2,t-1 oldest-first. */
+	 * 	(t), then SiLU. conv_hist holds t-3,t-2,t-1 oldest-first.
+	 * 	SSM_QUANT_U applied once u[] (post-conv, post-SiLU -- Python's
+	 * 	u_post_conv_silu) is fully computed. */
 	for (int c = 0; c < SSM_D_INNER; c++) {
 		float acc = SSM_CONV_B(w, c);
 		for (int k = 0; k < SSM_D_CONV - 1; k++) {
@@ -72,6 +85,9 @@ static void ssm_block_step(const ssm_block_weights_t *w,
 			conv_hist[c][k] = conv_hist[c][k + 1];
 		}
 		conv_hist[c][SSM_D_CONV - 2] = u_raw[c];
+	}
+	for (int c = 0; c < SSM_D_INNER; c++) {
+		u[c] = SSM_QUANT_U(w, u[c]);
 	}
 
 	/* x_proj on post-conv u -> delta_low / B / C */
@@ -99,7 +115,14 @@ static void ssm_block_step(const ssm_block_weights_t *w,
 	 * 	ssm_block.py's discretize(discretization="euler") +
 	 * 	_scan_streaming(): A_bar = 1 + clamp(delta*A, min=-1.9),
 	 * 	B_bar = delta*B. SSM_A dequantizes AND applies -exp(A_log) inline
-	 * 	when this field is quantized -- see ssm_weights.h. */
+	 * 	when that field is quantized -- see ssm_weights.h.
+	 *
+	 * 	y[c] here is Python's y_gated (post D-shortcut, post SiLU gate) --
+	 * 	SSM_QUANT_Y_GATED applies right after it's computed. y_c (the raw
+	 * 	scan output, pre-shortcut-and-gate -- Python's y_scan) has no
+	 * 	quantize hook: it's a scalar consumed on the same line it's
+	 * 	produced, not a materialized array. That's scan-group work, not
+	 * 	boundaries -- deliberately not wired yet. */
 	for (int c = 0; c < SSM_D_INNER; c++) {
 		float y_c = 0.0f;
 		for (int n = 0; n < SSM_D_STATE; n++) {
@@ -114,6 +137,7 @@ static void ssm_block_step(const ssm_block_weights_t *w,
 			y_c += new_h * C[n];
 		}
 		y[c] = (y_c + u[c] * SSM_D_PARAM(w, c)) * ssm_silu(z[c]);
+		y[c] = SSM_QUANT_Y_GATED(w, y[c]);
 	}
 
 	for (int o = 0; o < SSM_D_MODEL; o++) {
@@ -123,14 +147,16 @@ static void ssm_block_step(const ssm_block_weights_t *w,
 		}
 		block_out[o] = acc;
 	}
+	for (int o = 0; o < SSM_D_MODEL; o++) {
+		block_out[o] = SSM_QUANT_BLOCK_OUT(w, block_out[o]);
+	}
 }
 
 void SSMBackbone_Reset(SSMBackbone_State *state) {
 	memset(state, 0, sizeof(*state));
 }
 
-void SSMBackbone_ProcessFrame(SSMBackbone_State *state, const float *frame_in,
-		float *final_norm_out) {
+void SSMBackbone_ProcessFrame(SSMBackbone_State *state, const float *frame_in, float *final_norm_out) {
 	float x[SSM_D_MODEL];
 	float x_norm[SSM_D_MODEL];
 	float block_out[SSM_D_MODEL];
@@ -139,8 +165,7 @@ void SSMBackbone_ProcessFrame(SSMBackbone_State *state, const float *frame_in,
 
 	for (int layer = 0; layer < SSM_N_LAYERS; layer++) {
 		ssm_rmsnorm(x, &ssm_blocks[layer].norm_w, x_norm);
-		ssm_block_step(&ssm_blocks[layer], state->h[layer],
-				state->conv_hist[layer], x_norm, block_out);
+		ssm_block_step(&ssm_blocks[layer], state->h[layer], state->conv_hist[layer], x_norm, block_out);
 		for (int i = 0; i < SSM_D_MODEL; i++) {
 			x[i] += block_out[i];
 		}
@@ -148,9 +173,12 @@ void SSMBackbone_ProcessFrame(SSMBackbone_State *state, const float *frame_in,
 
 	float normed[SSM_D_MODEL];
 	ssm_rmsnorm(x, &ssm_final_norm_w, normed);
+	for (int i = 0; i < SSM_D_MODEL; i++) {
+		normed[i] = SSM_QUANT_FINAL_NORM(normed[i]);
+	}
 
 	for (int i = 0; i < SSM_D_MODEL; i++) {
-		state->pooled_sum[i] += normed[i];
+		state -> pooled_sum[i] += normed[i];
 	}
 	state->frame_count++;
 
@@ -167,7 +195,7 @@ void SSMBackbone_GetPooled(const SSMBackbone_State *state, float *pooled_out) {
 }
 
 void SSMBackbone_NormalizeFrame(const float *raw, float *normalized) {
-	for (int i = 0; i < SSM_D_MODEL; i++) {
-		normalized[i] = (raw[i] - ssm_norm_mean[i]) / ssm_norm_std[i];
-	}
+    for (int i = 0; i < SSM_D_MODEL; i++) {
+        normalized[i] = (raw[i] - ssm_norm_mean[i]) / ssm_norm_std[i];
+    }
 }
