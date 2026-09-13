@@ -178,7 +178,7 @@ SECTIONS
     __bss_end__ = _ebss;
   } >RAM
   
-  .ssm_state_dtcm :
+  .ssm_state_dtcm (NOLOAD) :
   {
     . = ALIGN(4);
     *(.ssm_state_dtcm)

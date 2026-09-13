@@ -4,34 +4,46 @@
 #include "arm_math.h"
 #include "mcu_feature_contract.h"
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cpluplus
 extern "C" {
 #endif
 
-/* Call once, before any FeaturePipeline_ComputeLogMelFrame calls. */
+/* Call once, before any other FeaturePipeline call. */
 void FeaturePipeline_Init(void);
 
 /*
- * frame:      MEL_N_FFT (1024) raw audio samples, NOT yet windowed.
+ * Assembles, scales and windows one frame from the retained overlap plus
+ * new_hop, then retains new_hop as the overlap for the following frame.
+ *
+ * new_hop: MEL_HOP_LENGTH raw int16 samples, in the format the host sends.
+ *          Scaling to float happens here -- the caller no longer converts.
+ *
+ * Once this returns, new_hop has been fully consumed and the caller may
+ * reuse or overwrite it, including by starting a DMA into it. Nothing the
+ * pipeline does after this point reads it.
+ *
+ * The overlap is zero-initialized at startup, matching librosa.stft's
+ * pad_mode='constant' zero padding for center=True -- every frame produced,
+ * including the first, is valid and correctly padded.
+ *
+ * Not reentrant, not ISR-safe -- uses internal static scratch.
+ */
+void FeaturePipeline_BeginFrame(const int16_t *new_hop);
+
+/*
+ * Transforms the frame assembled by the preceding FeaturePipeline_BeginFrame
+ * call into log-mel energies.
+ *
  * logmel_out: caller-provided buffer of MEL_N_MELS (64) floats. Receives
  *             natural-log mel energies, matching the Python reference's
  *             np.log(mel_spec + LOG_EPS).
  *
- * Not reentrant, not ISR-safe -- uses internal static scratch buffers.
+ * Calling this without a preceding BeginFrame produces garbage -- the
+ * scratch buffer is whatever the previous frame left behind.
  */
-void FeaturePipeline_ComputeLogMelFrame(const float32_t *frame, float32_t *logmel_out);
-
-/* Slides MEL_HOP_LENGTH new raw samples into the frame buffer, discarding
- * the oldest MEL_HOP_LENGTH samples. The buffer is zero-initialized at
- * startup, matching librosa.stft's pad_mode='constant' zero-padding for
- * center=True -- every frame produced, including the very first, is a
- * valid, correctly-padded frame. Nothing needs to be discarded. */
-void FeaturePipeline_PushHop(const float32_t *new_hop_samples);
-
-/* Returns a pointer to the current MEL_N_FFT-sample sliding frame, valid
- * until the next PushHop call. Feed this directly to ComputeLogMelFrame. */
-const float32_t *FeaturePipeline_GetCurrentFrame(void);
+void FeaturePipeline_FinishFrame(float32_t *logmel_out);
 
 #ifdef __cplusplus
 }

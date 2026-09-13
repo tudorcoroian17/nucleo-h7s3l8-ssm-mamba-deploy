@@ -66,6 +66,7 @@ static void MX_GPDMA1_Init(void);
 static void FatalBlink(Led_TypeDef led, uint32_t count);
 static HAL_StatusTypeDef TransmitAcked(const uint8_t *data,
 		uint32_t total_bytes);
+void ToDelete_InPlaceFFTTest(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -141,7 +142,7 @@ int main(void) {
 	/* Infinite loop */
 	/* USER CODE BEGIN WHILE */
 	while (1) {
-		printf("Waiting for clip...\r\n");
+		printf("Waiting for clip..12.\r\n");
 		uint32_t num_hops = AudioIngest_ReceiveClipHeader(AUDIO_MAX_SAMPLES);
 
 		if (num_hops == 0) {
@@ -188,16 +189,10 @@ int main(void) {
 				}
 			}
 
-			float32_t hop_f32[AUDIO_INGEST_HOP_SAMPLES];
-			for (uint32_t i = 0; i < AUDIO_INGEST_HOP_SAMPLES; i++) {
-				hop_f32[i] = (float32_t) hop_buf[active][i] / 32768.0f;
-			}
-
 			uint32_t t0 = DWT->CYCCNT;
-			FeaturePipeline_PushHop(hop_f32);
+			FeaturePipeline_BeginFrame(hop_buf[active]);
 			float32_t logmel_frame[MEL_N_MELS];
-			FeaturePipeline_ComputeLogMelFrame(
-					FeaturePipeline_GetCurrentFrame(), logmel_frame);
+			FeaturePipeline_FinishFrame(logmel_frame);
 			uint32_t t1 = DWT->CYCCNT;
 			feature_cycles_total += (t1 - t0);
 
@@ -213,16 +208,16 @@ int main(void) {
 			active = 1 - active;
 		}
 
-		if (rx_failed) {
-			/* A hop failed to arrive, possibly mid-DMA-transfer. Without this,
-			 * the UART is left marked busy, and every subsequent header
-			 * receive fails instantly instead of timing out normally --
-			 * producing an unthrottled retry loop instead of a paced one. */
-			HAL_UART_AbortReceive(&hcom_uart[COM1]);
-			BSP_LED_Off(LED_GREEN);
-			printf("RXFAIL: hop receive failed, abandoning clip\r\n");
-			continue;
-		}
+	if (rx_failed) {
+		/* A hop failed to arrive, possibly mid-DMA-transfer. Without this,
+		 * the UART is left marked busy, and every subsequent header
+		 * receive fails instantly instead of timing out normally --
+		 * producing an unthrottled retry loop instead of a paced one. */
+		HAL_UART_AbortReceive(&hcom_uart[COM1]);
+		BSP_LED_Off(LED_GREEN);
+		printf("RXFAIL: hop receive failed, abandoning clip\r\n");
+		continue;
+	}
 
 		static float32_t pooled_embedding[SSM_D_MODEL] __attribute__((aligned(32)));
 		SSMBackbone_GetPooled(&ssm_state, pooled_embedding);
@@ -469,9 +464,23 @@ static HAL_StatusTypeDef TransmitAcked(const uint8_t *data,
  */
 void Error_Handler(void) {
 	/* USER CODE BEGIN Error_Handler_Debug */
-	/* User can add his own implementation to report the HAL error return state */
 	__disable_irq();
+
+	/*	Blink rather than spin silently. A bare while(1) here is
+	 *  indistinguishable from a hard fault, a wedged UART, or a dead board,
+	 *  which costs a debugging session every time it fires.
+	 *
+	 *  HAL_Delay is unusable after __disable_irq -- it waits on the SysTick
+	 *  interrupt and would hang -- so this busy-waits instead. The count is
+	 *  approximate; it only has to be visible. */
+	BSP_LED_Init(LED_RED);
 	while (1) {
+		BSP_LED_On(LED_RED);
+		for (volatile uint32_t i = 0; i < 8000000u; i++) {
+		}
+		BSP_LED_Off(LED_RED);
+		for (volatile uint32_t i = 0; i < 8000000u; i++) {
+		}
 	}
 	/* USER CODE END Error_Handler_Debug */
 }
